@@ -1,6 +1,5 @@
 from tqdm import tqdm
 import h5py
-import nrrd
 import nibabel as nib
 import sys
 import os
@@ -11,42 +10,99 @@ import numpy as np
 from glob import glob
 from torch.utils.data import Dataset
 from dataclasses import dataclass
+import subprocess
+import pathlib
+from typing import Literal, Tuple
+import PIL
+import torch
 
 
 output_size =[128, 128, 80]
 
 
-def localize(image, mask, min_output_size):
-    if type(min_output_size) == int:
-        H = W = D = min_output_size
-    else:
-        H, W, D = min_output_size
+def require_download_msd():
+    dest_folder = pathlib.Path("./tmp/universeg_msd/")
 
-    tempL = np.nonzero(mask)
-    # Find the boundary of non-zero mask
-    minx, maxx = np.min(tempL[0]), np.max(tempL[0])
-    miny, maxy = np.min(tempL[1]), np.max(tempL[1])
-    minz, maxz = np.min(tempL[2]), np.max(tempL[2])
+    if not dest_folder.exists():
+        tar_url = "https://msd-for-monai.s3-us-west-2.amazonaws.com/Task01_BrainTumour.tar"
+        subprocess.run(
+            ["curl", tar_url, "--create-dirs", "-o",
+                str(dest_folder/'Task01_BrainTumour.tar'),],
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
 
-    # px, py, pz ensure the output image is at least of min_output_size
-    px = max(min_output_size[0] - (maxx - minx), 0) // 2
-    py = max(min_output_size[1] - (maxy - miny), 0) // 2
-    pz = max(min_output_size[2] - (maxz - minz), 0) // 2
-    # randint(10, 20) lets randomly-sized zero margins included in the output image
-    minx = max(minx - np.random.randint(10, 20) - px, 0)
-    maxx = min(maxx + np.random.randint(10, 20) + px, H)
-    miny = max(miny - np.random.randint(10, 20) - py, 0)
-    maxy = min(maxy + np.random.randint(10, 20) + py, W)
-    minz = max(minz - np.random.randint(5, 10) - pz, 0)
-    maxz = min(maxz + np.random.randint(5, 10) + pz, D)
+        subprocess.run(
+            ["tar", 'xf', str(
+                dest_folder/'Task01_BrainTumour.tar'), '-C', str(dest_folder)],
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
 
-    if len(image.shape) == 4:
-        image = image[:, minx:maxx, miny:maxy, minz:maxz]
-    else:
-        image = image[minx:maxx, miny:maxy, minz:maxz]
+    return dest_folder
 
-    mask = mask[minx:maxx, miny:maxy, minz:maxz]
-    return image, mask
+def process_img(path: pathlib.Path, size: Tuple[int, int]):
+    img = (nib.load(path).get_fdata() * 255).astype(np.uint8).squeeze()
+    img = PIL.Image.fromarray(img)
+    img = img.resize(size, resample=PIL.Image.BILINEAR)
+    img = img.convert("L")
+    img = np.array(img)
+    img = img.astype(np.float32)/255
+    img = np.rot90(img, -1)
+    return img.copy()
+
+
+def process_seg(path: pathlib.Path, size: Tuple[int, int]):
+    seg = nib.load(path).get_fdata().astype(np.int8).squeeze()
+    seg = PIL.Image.fromarray(seg)
+    seg = seg.resize(size, resample=PIL.Image.NEAREST)
+    seg = np.array(seg)
+    seg = seg.astype(np.float32)
+    seg = np.rot90(seg, -1)
+    return seg.copy()
+
+def load_folder(path: pathlib.Path, size: Tuple[int, int] = (128, 128)):
+    data = []
+    for file in sorted(path.glob("imagesTr/*.nii.gz")):
+        img = process_img(file, size=size)
+        seg_file = pathlib.Path(str(file).replace("imagesTr", "labelsTr"))
+        seg = process_seg(seg_file, size=size)
+        data.append((img, seg))
+    return data
+
+
+@dataclass
+class MSDDataset(Dataset):
+    split: Literal["support", "test"]
+    label: int
+    support_frac: float = 0.7
+
+    def __post_init__(self):
+        path = require_download_msd()
+        currentDir = os.path.abspath(os.getcwd())
+        path = currentDir / path
+        T = torch.from_numpy
+        self._data = [(T(x)[None], T(y)) for x, y in load_folder(path)]
+        if self.label is not None:
+            self._ilabel = self.label
+        self._idxs = self._split_indexes()
+
+    def _split_indexes(self):
+        rng = np.random.default_rng(42)
+        N = len(self._data)
+        p = rng.permutation(N)
+        i = int(np.floor(self.support_frac * N))
+        return {"support": p[:i], "test": p[i:]}[self.split]
+
+    def __len__(self):
+        return len(self._idxs)
+
+    def __getitem__(self, idx):
+        img, seg = self._data[self._idxs[idx]]
+        if self.label is not None:
+            seg = (seg == self._ilabel)[None]
+        return img, seg
+
 
 def covert_h5(root):
     listt = glob( os.path.join(root, 'imagesTr/*.nii.gz') )
@@ -104,134 +160,8 @@ def covert_h5(root):
         f.create_dataset('label', data=label, compression="gzip")
         f.close()
 
-@dataclass
-class BratsSet(Dataset):
-    """ Annual Brats challenges dataset """
-
-    # binarize: whether to binarize mask (do whole-tumor segmentation)
-    # modality: if the image has multiple modalities,
-    # choose which modality to output (-1 to output all).
-    # If mode == 'train' and train_loc_prob > 0, then min_output_size is necessary.
-    def __init__(self, base_dir, split, mode, sample_num=None,
-                 ds_weight=1.,
-                 xyz_permute=None, transform=None,
-                 chosen_modality=-1, binarize=False,
-                 train_loc_prob=0, min_output_size=None):
-        super(BratsSet, self).__init__()
-        self._base_dir = base_dir
-        self.split = split
-        self.mode = mode
-        self.xyz_permute = xyz_permute
-        self.ds_weight = ds_weight
-
-        self.transform = transform
-        self.chosen_modality = chosen_modality
-        self.binarize = binarize
-        self.train_loc_prob = train_loc_prob
-        self.min_output_size = min_output_size
-
-        trainlist_filepath = self._base_dir + '/train.list'
-        testlist_filepath = self._base_dir + '/test.list'
-        alllist_filepath = self._base_dir + '/all.list'
-
-        if not os.path.isfile(alllist_filepath):
-            self.create_file_list(0.85)
-
-        with open(trainlist_filepath, 'r') as f:
-            self.train_image_list = f.readlines()
-        with open(testlist_filepath, 'r') as f:
-            self.test_image_list = f.readlines()
-        with open(alllist_filepath, 'r') as f:
-            self.all_image_list = f.readlines()
-
-        if self.split == 'train':
-            self.image_list = self.train_image_list
-        elif self.split == 'test':
-            self.image_list = self.test_image_list
-        elif self.split == 'all':
-            self.image_list = self.all_image_list
-
-        self.image_list = [item.replace('\n', '') for item in self.image_list]
-        if sample_num is not None:
-            self.image_list = self.image_list[:sample_num]
-
-        self.num_modalities = 0
-        # Fetch image 0 to get num_modalities.
-        sample0 = self.__getitem__(0, do_transform=False)
-        if len(sample0['image'].shape) == 4:
-            self.num_modalities = sample0['image'].shape[0]
-
-        print("'{}' {} samples, num_modalities: {}, chosen: {}".format(self.split,
-                                                                       len(self.image_list), self.num_modalities,
-                                                                       self.chosen_modality))
-
-    def __len__(self):
-        return len(self.image_list)
-
-    def __getitem__(self, idx, do_transform=True):
-        image_name = self.image_list[idx]
-        image_path = os.path.join(self._base_dir, image_name)
-        h5f = h5py.File(image_path, 'r')
-        image = h5f['image'][:]
-        mask = h5f['label'][:]
-        if self.num_modalities > 0 and self.chosen_modality != -1:
-            image = image[self.chosen_modality, :, :, :]
-        if self.binarize:
-            mask = (mask >= 1).astype(np.uint8)
-        else:
-            # Map 4 to 3, and keep 0,1,2 unchanged.
-            mask -= (mask == 4)
-
-        if self.mode == 'train' and self.train_loc_prob > 0 \
-                and np.random.random() < self.train_loc_prob:
-            image, mask = localize(image, mask, self.min_output_size)
-
-        # xyz_permute by default is None.
-        if do_transform and self.xyz_permute is not None:
-            image = image.transpose(self.xyz_permute)
-            mask = mask.transpose(self.xyz_permute)
-
-        sample = {'image': image, 'mask': mask}
-        if do_transform and self.transform:
-            sample = self.transform(sample)
-
-        sample['image_path'] = image_name
-        sample['weight'] = self.ds_weight
-        return sample
-
-    def create_file_list(self, train_test_split):
-        img_dirs = [d for d in listdir(self._base_dir) if isdir(join(self._base_dir, d))]
-
-        # Randomize the file list, then split. Not to use the official testing set
-        # since we don't have ground truth masks for this.
-        num_files = len(img_dirs)
-        idxList = np.arange(num_files)  # List of file indices
-        self.imgFiles = {}
-        for idx in idxList:
-            self.imgFiles[idx] = join(img_dirs[idx], img_dirs[idx] + ".h5")
-
-        with open(join(self._base_dir, 'all.list'), "w") as allFile:
-            for img_idx in idxList:
-                allFile.write("%s\n" % self.imgFiles[img_idx])
-        allFile.close()
-
-        idxList = np.random.permutation(idxList)  # Randomize list
-        train_len = int(np.floor(num_files * train_test_split))  # Number of training files
-        train_indices = idxList[0:train_len]  # List of training indices
-        test_indices = idxList[train_len:]  # List of testing indices
-
-        with open(join(self._base_dir, 'train.list'), "w") as trainFile:
-            for img_idx in sorted(train_indices):
-                trainFile.write("%s\n" % self.imgFiles[img_idx])
-        trainFile.close()
-
-        with open(join(self._base_dir, 'test.list'), "w") as testFile:
-            for img_idx in sorted(test_indices):
-                testFile.write("%s\n" % self.imgFiles[img_idx])
-        testFile.close()
-
-        print("%d files are split to %d training, %d test" % (num_files, train_len, len(test_indices)))
 
 if __name__ == '__main__':
+
     covert_h5(sys.argv[1])
     
